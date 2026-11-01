@@ -1,1 +1,0 @@
-// The initial file of the team project
