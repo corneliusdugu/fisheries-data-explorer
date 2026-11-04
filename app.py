@@ -59,6 +59,50 @@ def load_eez_regions(_token: str) -> pd.DataFrame:
     # Return valid sea regions
     return result
 
+
+# Request regional fishing activity
+async def fetch_regional(token, start, end, spatial, region_id, temporal):
+    # Create a fishing report
+    result = await make_client(token).fourwings.create_report(
+        # Choose fishing activity dataset
+        datasets=[DATASET],
+        # Choose map detail level
+        spatial_resolution=spatial,
+        # Choose report time interval
+        temporal_resolution=temporal,
+        # Group results by gear
+        group_by="GEARTYPE",
+        # Set first report day
+        start_date=start.isoformat(),
+        # Include the final day
+        end_date=(end + timedelta(days=1)).isoformat(),
+        # Choose selected sea area
+        region={"dataset": REGION_DATASET, "id": str(region_id)},
+    )
+    # Convert report into table
+    df = result.df()
+    # Check table format
+    if not isinstance(df, pd.DataFrame):
+        # Reject unexpected report data
+        raise ValueError("The GFW report could not be converted to a table.")
+    # Return fishing data table
+    return df
+
+# Measure downloaded data quality
+def dataframe_quality(df):
+    """Checks only; do not silently discard or change scientific observations."""
+    # Collect simple quality checks
+    return {
+        # Count total data rows
+        "records": int(len(df)),
+        # List downloaded table columns
+        "columns": list(map(str, df.columns)),
+        # Count identical data rows
+        "exact_duplicate_rows": int(df.duplicated().sum()),
+        # Count empty column values
+        "missing_values_by_column": {str(k): int(v) for k, v in df.isna().sum().items()},
+    }
+
 # Load private API credentials
 # Try reading API key
 try:
@@ -93,6 +137,11 @@ except Exception:
     # Stop when regions unavailable
     st.stop()
 
+# Remember the last download
+# Look for previous results
+if "last_result" not in st.session_state:
+    # Start with empty results
+    st.session_state.last_result = None
 
 # Make area choices distinct
 # Sort regions by name
@@ -147,6 +196,107 @@ with st.form("fishing_request", border=True):
     submitted = st.form_submit_button("Retrieve fishing data", type="primary", use_container_width=True)
 
 
+# Start after button click
 if submitted:
-    # Explain the upcoming feature
-    st.info("The selection form is ready. Fishing-data retrieval is introduced in the next stage.")
+    # Check area was selected
+    if selected_label is None:
+        # Warn when area missing
+        st.error("Choose a geographical area before retrieving data.")
+    # Check date order
+    elif start > end:
+        # Explain incorrect date order
+        st.error("The start date must be on or before the end date.")
+    # Continue with valid choices
+    else:
+        # Find selected region identifier
+        region_id = region_labels[selected_label]
+        # Extract selected region name
+        region_name = selected_label.rsplit(" (EEZ #", 1)[0]
+        # Check for oversized requests
+        if spatial == "HIGH" and temporal == "DAILY" and (end - start).days > 31:
+            # Suggest smaller requests
+            st.warning("High-resolution daily requests over long periods may be very large and slow. Consider a shorter period if the request fails.")
+        # Show request progress
+        with st.spinner("Requesting fishing activity from Global Fishing Watch..."):
+            # Handle unexpected request errors
+            try:
+                # Download regional fishing activity
+                regional = asyncio.run(fetch_regional(TOKEN, start, end, spatial, region_id, temporal))
+                # Check for empty results
+                if regional.empty:
+                    # Explain empty data results
+                    st.warning("The selected request returned no fishing activity rows. Try another region or time period. This does not prove that no fishing occurred.")
+                # Continue when data exists
+                else:
+                    # Record search settings
+                    details = {
+                        # Save area name
+                        "area": region_name,
+                        # Save area identifier
+                        "region_id": region_id,
+                        # Save chosen starting date
+                        "start": start,
+                        # Save chosen ending date
+                        "end": end,
+                        # Save chosen map detail
+                        "spatial": spatial,
+                        # Save chosen time interval
+                        "temporal": temporal,
+                        # Record download time
+                        "retrieved_at": datetime.now(timezone.utc),
+                    }
+                    # Store the latest results
+                    st.session_state.last_result = {
+                        # Keep regional data table
+                        "regional": regional,
+                        # Keep original search choices
+                        "info": details,
+                    }
+                    # Confirm data was downloaded
+                    st.success("Regional fishing data retrieved successfully.")
+            # Handle regional request errors
+            except Exception:
+                # Explain why request failed
+                st.error("Unable to retrieve regional fishing data. Check your selection, network or API access and try again. Previously retrieved data, if any, is still available below.")
+
+# Load any saved results
+saved = st.session_state.last_result
+# Check saved results exist
+if saved is not None:
+    # Restore original search choices
+    info = saved["info"]
+    # Restore regional activity table
+    regional = saved["regional"]
+    # Check regional table quality
+    quality = dataframe_quality(regional)
+
+    # Separate form and results
+    st.divider()
+    # Show results section heading
+    st.subheader("2 · Review retrieved data")
+    # Check changed search choices
+    if selected_label is None or region_labels.get(selected_label) != info["region_id"] or (
+        start != info["start"] or end != info["end"] or spatial != info["spatial"]
+        or temporal != info["temporal"]
+    ):
+        # Warn about older results
+        st.warning("Current form selections differ from the saved result below. Submit a new request to update it; these downloads still refer to the previous request.")
+
+    # Create three summary boxes
+    a, b, c = st.columns(3)
+    # Show number of rows
+    a.metric("Regional observations", f"{len(regional):,}")
+    # Show count of duplicates
+    b.metric("Exact duplicate rows", f"{quality['exact_duplicate_rows']:,}")
+    # Show number of columns
+    c.metric("Columns", f"{len(regional.columns):,}")
+    # Display original search details
+    st.write(
+        f"**Region:** {info['area']} (EEZ #{info['region_id']})  |  "
+        f"**Period:** {info['start']} to {info['end']}  |  "
+        f"**Spatial:** {info['spatial']}  |  **Temporal:** {info['temporal']}"
+    )
+    # Explain the preview limit
+    st.caption("Preview: first 10 rows only. The downloaded regional CSV contains the entire returned DataFrame without automatic filtering or removal of rows.")
+    # Preview first ten rows
+    st.dataframe(regional.head(10), use_container_width=True, hide_index=True)
