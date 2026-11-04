@@ -29,6 +29,14 @@ GLOBAL_STATS_URL = "https://gateway.api.globalfishingwatch.org/v3/4wings/stats/"
 st.set_page_config(page_title="Fisheries Data Explorer", page_icon=None, layout="wide")
 
 
+# Make safe download filenames
+def filename_part(text: str) -> str:
+    """Create a short, predictable, filename-safe region label."""
+    # Remove unsafe filename characters
+    cleaned = re.sub(r"[^a-z0-9]+", "_", str(text).lower()).strip("_")
+    # Keep filenames short
+    return cleaned[:24].rstrip("_") or "region"
+
 # Create fishing API connection
 def make_client(token: str) -> Client:
     # Use provided access token
@@ -300,3 +308,20 @@ if saved is not None:
     st.caption("Preview: first 10 rows only. The downloaded regional CSV contains the entire returned DataFrame without automatic filtering or removal of rows.")
     # Preview first ten rows
     st.dataframe(regional.head(10), use_container_width=True, hide_index=True)
+
+    # Create regional CSV filename
+    regional_name = (
+        f"fishing_{filename_part(info['area'])}_{info['region_id']}_"
+        f"{info['start']:%Y%m%d}-{info['end']:%Y%m%d}_"
+        f"{info['spatial'][0]}_{info['temporal'][0]}.csv"
+    )
+    # Show CSV download heading
+    st.subheader("3 · Download for offline research")
+    # Create regional download button
+    st.download_button(
+        "Download complete regional CSV",
+        # Turn regional table into CSV
+        data=regional.to_csv(index=False).encode("utf-8"),
+        # Set downloaded CSV filename
+        file_name=regional_name, mime="text/csv", use_container_width=True,
+    )
