@@ -37,6 +37,7 @@ def filename_part(text: str) -> str:
     # Keep filenames short
     return cleaned[:24].rstrip("_") or "region"
 
+
 # Create fishing API connection
 def make_client(token: str) -> Client:
     # Use provided access token
@@ -95,6 +96,52 @@ async def fetch_regional(token, start, end, spatial, region_id, temporal):
         raise ValueError("The GFW report could not be converted to a table.")
     # Return fishing data table
     return df
+
+
+# Request worldwide fishing figures
+def fetch_global(token, start, end):
+    """Worldwide aggregate — NOT the same spatial/temporal granularity as regional rows."""
+    # Call worldwide statistics service
+    response = requests.get(
+        # Use worldwide statistics address
+        GLOBAL_STATS_URL,
+        # Set request details
+        params={
+            # Select fishing dataset
+            "datasets[0]": DATASET,
+            # Choose worldwide statistics fields
+            "fields": "FLAGS,VESSEL-IDS,ACTIVITY-HOURS",
+            # Set requested date range
+            "date-range": f"{start.isoformat()},{(end + timedelta(days=1)).isoformat()}",
+        },
+        # Send private access token
+        headers={"Authorization": f"Bearer {token}"},
+        # Limit waiting time
+        timeout=90,
+    )
+    # Reject failed web requests
+    response.raise_for_status()
+    # Read returned statistics
+    payload = response.json()
+    # Check response contains entries
+    if not isinstance(payload, list) or not payload:
+        # Reject invalid worldwide results
+        raise ValueError("GFW returned an unexpected global statistics response.")
+    # Create worldwide data table
+    df = pd.DataFrame(payload)
+    # Check fishing hours present
+    if "activityHours" not in df.columns:
+        # Reject missing fishing hours
+        raise ValueError("Global statistics response does not include activityHours.")
+    # Store first selected date
+    df["start_date"] = start.isoformat()
+    # Store last selected date
+    df["end_date"] = end.isoformat()
+    # Mark results as worldwide
+    df["scope"] = "worldwide_aggregate"
+    # Return worldwide summary
+    return df
+
 
 # Measure downloaded data quality
 def dataframe_quality(df):
@@ -200,9 +247,13 @@ with st.form("fishing_request", border=True):
             index=1,
             format_func=lambda t: {"DAILY": "Daily", "MONTHLY": "Monthly", "YEARLY": "Yearly"}[t],
         )
+    # Offer optional worldwide summary
+    include_global = st.checkbox(
+        "Also retrieve worldwide summary statistics (separate CSV)", value=False,
+        help="The global export has one aggregate for the chosen date range, not comparable grid-level rows.",
+    )
     # Add request submission button
     submitted = st.form_submit_button("Retrieve fishing data", type="primary", use_container_width=True)
-
 
 # Start after button click
 if submitted:
@@ -236,6 +287,20 @@ if submitted:
                     st.warning("The selected request returned no fishing activity rows. Try another region or time period. This does not prove that no fishing occurred.")
                 # Continue when data exists
                 else:
+                    # Start without global data
+                    worldwide = None
+                    # Start without global errors
+                    global_error = None
+                    # Check worldwide option
+                    if include_global:
+                        # Try requesting worldwide totals
+                        try:
+                            # Download worldwide summary figures
+                            worldwide = fetch_global(TOKEN, start, end)
+                        # Handle worldwide service errors
+                        except (requests.RequestException, ValueError, TypeError):
+                            # Keep regional data available
+                            global_error = "The global summary request did not complete. Regional data is still available; try again later."
                     # Record search settings
                     details = {
                         # Save area name
@@ -250,6 +315,8 @@ if submitted:
                         "spatial": spatial,
                         # Save chosen time interval
                         "temporal": temporal,
+                        # Save worldwide selection
+                        "include_global": include_global,
                         # Record download time
                         "retrieved_at": datetime.now(timezone.utc),
                     }
@@ -257,6 +324,10 @@ if submitted:
                     st.session_state.last_result = {
                         # Keep regional data table
                         "regional": regional,
+                        # Keep worldwide statistics table
+                        "global": worldwide,
+                        # Keep worldwide request errors
+                        "global_error": global_error,
                         # Keep original search choices
                         "info": details,
                     }
@@ -275,6 +346,8 @@ if saved is not None:
     info = saved["info"]
     # Restore regional activity table
     regional = saved["regional"]
+    # Restore worldwide data table
+    worldwide = saved["global"]
     # Check regional table quality
     quality = dataframe_quality(regional)
 
@@ -285,7 +358,7 @@ if saved is not None:
     # Check changed search choices
     if selected_label is None or region_labels.get(selected_label) != info["region_id"] or (
         start != info["start"] or end != info["end"] or spatial != info["spatial"]
-        or temporal != info["temporal"]
+        or temporal != info["temporal"] or include_global != info["include_global"]
     ):
         # Warn about older results
         st.warning("Current form selections differ from the saved result below. Submit a new request to update it; these downloads still refer to the previous request.")
@@ -325,3 +398,49 @@ if saved is not None:
         # Set downloaded CSV filename
         file_name=regional_name, mime="text/csv", use_container_width=True,
     )
+
+    # Check for worldwide errors
+    if saved["global_error"]:
+        # Display worldwide error message
+        st.warning(saved["global_error"])
+
+    # Show available worldwide results
+    if worldwide is not None:
+        # Create worldwide CSV filename
+        global_name = f"fishing_global_{info['start']:%Y%m%d}-{info['end']:%Y%m%d}.csv"
+        # Create worldwide download button
+        st.download_button(
+            "Download worldwide summary CSV",
+            # Turn worldwide data into CSV
+            data=worldwide.to_csv(index=False).encode("utf-8"),
+            file_name=global_name, mime="text/csv", use_container_width=True,
+        )
+        # Explain worldwide summary limits
+        st.info("The worldwide statistics CSV contains aggregate activityHours, vesselIds and flags for the whole reporting period. It does not include the region's daily/monthly grid observations or spatial/temporal resolution.")
+
+        # Show comparison section
+        st.subheader("Interpretation and comparison")
+        # Add worldwide fishing hours
+        global_hours = pd.to_numeric(worldwide.get("activityHours"), errors="coerce").sum(min_count=1)
+        # Calculate regional fishing hours
+        regional_hours = (
+            # Add regional fishing hours
+            pd.to_numeric(regional["hours"], errors="coerce").sum(min_count=1)
+            # Handle missing regional hours
+            if "hours" in regional else float("nan")
+        )
+        # Position comparison figures together
+        x, y = st.columns(2)
+        # Display total regional hours
+        x.metric("Regional sum of reported hours", f"{regional_hours:,.1f}" if pd.notna(regional_hours) else "Not available")
+        # Display total worldwide hours
+        y.metric("Worldwide reported activity hours", f"{global_hours:,.1f}" if pd.notna(global_hours) else "Not available")
+        # Warn figures differ in meaning
+        st.warning(
+            "These two figures come from DIFFERENT GFW endpoints/aggregations. "
+            "They share a requested AIS dataset and date range, but comparable measurement "
+            "definitions, aggregation and overlap have not been independently validated. "
+            "Do not interpret their ratio as the region's verified share of worldwide fishing effort. "
+            "Worldwide vessel/flag counts are distinct counts, not row-by-row equivalents."
+        )
+
