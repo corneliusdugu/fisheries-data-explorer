@@ -16,3 +16,6 @@ __MACOSX/
 
 # Exports generated during manual testing
 *.csv
+
+.streamlit/
+.agents/
