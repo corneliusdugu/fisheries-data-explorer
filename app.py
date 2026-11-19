@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import pycountry
+import pydeck as pdk
 import requests
 import streamlit as st
 from gfwapiclient import Client
@@ -200,6 +201,81 @@ def dataframe_quality(df):
     }
 
 
+def prepare_heatmap(df):
+    """Combine fishing hours at identical grid locations."""
+    required = {"lat", "lon", "hours"}
+    if not required.issubset(df.columns):
+        return pd.DataFrame(columns=["lat", "lon", "hours"]), len(df), None
+    points = df[["lat", "lon", "hours"]].apply(pd.to_numeric, errors="coerce")
+    # Exclude invalid map values only.
+    valid = (
+        points["lat"].between(-85.05112878, 85.05112878)
+        & points["lon"].between(-180, 180)
+        & points["hours"].map(math.isfinite)
+        & points["hours"].ge(0)
+    )
+    skipped = int((~valid).sum())
+    points = points.loc[valid]
+    cells = points.groupby(["lat", "lon"], as_index=False)["hours"].sum()
+    total = float(cells["hours"].sum())
+    return cells.loc[cells["hours"].gt(0)].copy(), skipped, total
+
+
+def heatmap_view(cells):
+    """Fit the retrieved grid locations."""
+    # Handle longitude wrap at dateline.
+    longitudes = sorted((float(x) + 360) % 360 for x in cells["lon"].unique())
+    gaps = [b - a for a, b in zip(longitudes, longitudes[1:])]
+    gaps.append(longitudes[0] + 360 - longitudes[-1])
+    largest = max(range(len(gaps)), key=gaps.__getitem__)
+    span_lon = 360 - gaps[largest]
+    west = longitudes[(largest + 1) % len(longitudes)]
+    center_lon = (west + span_lon / 2 + 180) % 360 - 180
+    south, north = float(cells["lat"].min()), float(cells["lat"].max())
+    center_lat = (south + north) / 2
+    # Allow for Mercator latitude distortion.
+    span_lat = (north - south) / max(0.087, math.cos(math.radians(center_lat)))
+    extent = max(span_lon, span_lat, 0.05)
+    zoom = max(0, min(10, math.log2(150 / extent)))
+    return dict(latitude=center_lat, longitude=center_lon, zoom=zoom)
+
+
+def display_heatmap(regional):
+    """Visualise the saved regional dataset."""
+    st.subheader("Fishing activity heatmap")
+    cells, skipped, total = prepare_heatmap(regional)
+    if total is None:
+        st.info("A heatmap requires latitude, longitude and fishing hours in the retrieved dataset.")
+        return
+    if skipped:
+        st.warning(f"{skipped:,} rows cannot be mapped because of invalid coordinates/hours or the map's polar latitude limit. The CSV is unchanged.")
+    if cells.empty or not math.isfinite(total):
+        st.info("No positive finite fishing activity is available to display on the map.")
+        return
+    st.caption(f"{len(cells):,} positive-effort grid locations · {total:,.2f} reported fishing hours represented. Hours are summed across the saved period, flags and gear types at each location.")
+    colors = [[37, 99, 235], [34, 211, 238], [52, 211, 89], [250, 204, 21], [249, 115, 22], [220, 38, 38]]
+    layer = pdk.Layer(
+        "HeatmapLayer",
+        data=cells,
+        get_position="[lon, lat]",
+        get_weight="hours",
+        aggregation="SUM",
+        radius_pixels=28,
+        color_range=colors,
+        opacity=0.8,
+    )
+    deck = pdk.Deck(
+        layers=[layer],
+        initial_view_state=pdk.ViewState(**heatmap_view(cells), pitch=0),
+        map_provider="carto",
+        map_style="light",
+        views=[pdk.View(type="MapView", controller=True, repeat=True)],
+    )
+    st.pydeck_chart(deck, use_container_width=True, height=520)
+    st.caption("Relative intensity: blue/cyan = lower, green/yellow = intermediate, orange/red = higher. Drag to pan and scroll to zoom. Colours are relative to the current view, not fixed numeric intervals.")
+    st.caption("This is a smoothed, screen-space visualisation of reported hours, not an exact cell-boundary map or an area-normalised density estimate. The map requires internet access and browser WebGL; the CSV remains the research dataset.")
+
+
 def export_metadata(info, regional, global_df, quality):
     return {
         "application": "Fisheries Data Explorer",
@@ -235,6 +311,7 @@ def export_metadata(info, regional, global_df, quality):
         "global_comparison_requested": info["include_global"],
         "global_statistics_returned": global_df is not None,
         "global_statistics_note": "Worldwide aggregate over the full date window; no matching regional grid cells or temporal breakdown",
+        "heatmap_method": "Visual only: sum reported hours by identical regional grid coordinates; screen-space weighted heatmap. Invalid/out-of-Mercator-range rows and zero-weight cells are omitted from the map only. Colours are relative, not fixed bins or area-normalised density.",
         "limitations": [
             "GFW apparent fishing effort is estimated from vessel tracking and classification algorithms.",
             "AIS coverage varies; fishing activity without usable AIS may be absent.",
@@ -433,6 +510,8 @@ if saved is not None:
     if regional["flag"].eq("Unknown").all():
         st.warning("No vessel flag nationality was returned for these observations. The EEZ label is not a substitute for vessel nationality.")
     st.dataframe(coordinate_preview(regional), use_container_width=True, hide_index=True)
+
+    display_heatmap(regional)
 
     spatial_code = f"custom_{info['grid_size']:g}deg" if info.get("grid_size") else info["spatial"][0]
     bounds_code = ""
