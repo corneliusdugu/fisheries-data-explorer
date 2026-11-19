@@ -135,6 +135,22 @@ def fetch_global(token, start, end):
     return df
 
 
+def remove_empty_columns(df):
+    """Remove only entirely missing columns."""
+    removed = []
+    for column in df.columns:
+        values = df[column]
+        missing = values.isna()
+        if pd.api.types.is_object_dtype(values) or pd.api.types.is_string_dtype(values):
+            placeholders = values.astype("string").str.strip().str.lower().isin(
+                ["", "none", "null", "nan", "<na>"]
+            )
+            missing = missing | placeholders
+        if missing.all():
+            removed.append(column)
+    return df.drop(columns=removed).copy(), removed
+
+
 def dataframe_quality(df):
     """Checks only; do not silently discard or change scientific observations."""
     return {
@@ -170,6 +186,9 @@ def export_metadata(info, regional, global_df, quality):
         "temporal_resolution": info["temporal"],
         "regional_grouping": "GEARTYPE",
         "regional_data_quality_checks": quality,
+        "regional_columns_before_cleaning": info.get("columns_before_cleaning", len(regional.columns)),
+        "regional_empty_columns_removed": info.get("empty_columns_removed", []),
+        "regional_cleaning_method": "Remove entirely missing columns only (null values and common textual null placeholders). No rows removed by this step; partially populated columns retained.",
         "global_comparison_requested": info["include_global"],
         "global_statistics_returned": global_df is not None,
         "global_statistics_note": "Worldwide aggregate over the full date window; no matching regional grid cells or temporal breakdown",
@@ -287,6 +306,9 @@ if submitted:
                 if regional.empty:
                     st.warning("The selected request returned no fishing activity rows. Try another region or time period. This does not prove that no fishing occurred.")
                 else:
+                    # Remove entirely empty columns.
+                    columns_before_cleaning = len(regional.columns)
+                    regional, empty_columns_removed = remove_empty_columns(regional)
                     worldwide = None
                     global_error = None
                     if include_global:
@@ -300,6 +322,8 @@ if submitted:
                         "bounds": bounds,
                         "source_rows": source_rows,
                         "filtered_rows": filtered_rows,
+                        "columns_before_cleaning": columns_before_cleaning,
+                        "empty_columns_removed": [str(c) for c in empty_columns_removed],
                         "start": start,
                         "end": end,
                         "spatial": spatial,
@@ -350,6 +374,12 @@ if saved is not None:
         st.caption(f"Source rows within bounds: {info['filtered_rows']:,} of {info['source_rows']:,}. Selection uses source cell centres, not exact cell boundaries.")
     if info.get("grid_size"):
         st.info(f"Custom {info['grid_size']:g}° grid: LOW (0.1°) source cells assigned by centre; hours summed by date and gear. Coordinates are custom cell centres, not vessel positions; after coordinate filtering, custom cell centres may fall outside the bounds. Vessel counts are omitted because they cannot be safely summed.")
+    removed = info.get("empty_columns_removed", [])
+    before = info.get("columns_before_cleaning", len(regional.columns))
+    st.caption(f"Dataset cleaning: {before} columns before cleaning; {len(removed)} entirely empty columns removed. No observations removed by cleaning.")
+    if removed:
+        with st.expander("View removed empty columns"):
+            st.write(", ".join(removed))
     st.caption("Preview: first 10 rows only. The CSV contains all rows of the displayed dataset (locally aggregated when Custom is selected).")
     st.dataframe(regional.head(10), use_container_width=True, hide_index=True)
 
@@ -425,7 +455,7 @@ if saved is not None:
 with st.expander("About the datasets and how to use them"):
     st.write(
         "**Regional CSV:** detailed AIS-based apparent fishing-effort estimates grouped by gear type, "
-        "with the fields returned by the selected GFW report. "
+        "with entirely empty columns removed from the selected report. "
         "**Worldwide CSV:** one aggregated statistics record for the requested date range. "
         "**Metadata JSON:** original settings, timestamp, quality checks and interpretation caveats. "
         "The global and regional exports are NOT matching row-level datasets. "
