@@ -59,6 +59,18 @@ async def fetch_regional(token, start, end, spatial, region_id, temporal):
     return df
 
 
+def filter_coordinates(df, bounds):
+    """Keep source grid centres inside inclusive coordinate bounds."""
+    if not {"lat", "lon"}.issubset(df.columns):
+        raise ValueError("Coordinate filtering requires latitude and longitude.")
+    south, north, west, east = bounds
+    lat = pd.to_numeric(df["lat"], errors="coerce")
+    lon = pd.to_numeric(df["lon"], errors="coerce")
+    if not (lat.between(-90, 90).all() and lon.between(-180, 180).all()):
+        raise ValueError("Source data contains missing or invalid coordinates.")
+    return df.loc[lat.between(south, north) & lon.between(west, east)].copy()
+
+
 def aggregate_grid(df, grid_size):
     """Sum fishing hours by date, gear and custom grid cell."""
     # SDK exposes gear_type rather than geartype.
@@ -144,6 +156,10 @@ def export_metadata(info, regional, global_df, quality):
         "geographical_area": info["area"],
         "region_dataset": REGION_DATASET,
         "region_id": info["region_id"],
+        "coordinate_bounds": dict(zip(["south", "north", "west", "east"], info["bounds"])) if info.get("bounds") else None,
+        "coordinate_filter_method": "Inclusive source grid-centre filter within selected EEZ, applied locally before custom aggregation; not an exact polygon intersection." if info.get("bounds") else None,
+        "source_rows_before_coordinate_filter": info.get("source_rows"),
+        "source_rows_after_coordinate_filter": info.get("filtered_rows"),
         "start_date_inclusive": info["start"].isoformat(),
         "end_date_inclusive": info["end"].isoformat(),
         "api_end_date_exclusive": (info["end"] + timedelta(days=1)).isoformat(),
@@ -202,8 +218,19 @@ with st.form("fishing_request", border=True):
         options=labels,
         index=None,
         placeholder="Search for Norway or another EEZ",
-        help="Only the EEZ regions provided by GFW are listed. Arbitrary drawn areas are not currently supported.",
+        help="Choose an EEZ; optionally restrict its returned grid centres using coordinate bounds below.",
     )
+    restrict_area = st.checkbox("Restrict EEZ by latitude and longitude", value=False)
+    st.caption("Optional bounds in decimal degrees. Applied only when the checkbox is selected. Negative values mean south or west.")
+    lat_col, lon_col = st.columns(2)
+    with lat_col:
+        south = st.number_input("Minimum latitude (south)", -90.0, 90.0, 58.0, step=0.1, format="%.6f")
+        north = st.number_input("Maximum latitude (north)", -90.0, 90.0, 62.0, step=0.1, format="%.6f")
+    with lon_col:
+        west = st.number_input("Minimum longitude (west)", -180.0, 180.0, 3.0, step=0.1, format="%.6f")
+        east = st.number_input("Maximum longitude (east)", -180.0, 180.0, 8.0, step=0.1, format="%.6f")
+    bounds = (south, north, west, east) if restrict_area else None
+    st.caption("Bounds filter the returned EEZ grid centres locally; they do not reduce the API request size. Boxes crossing the antimeridian are not supported.")
     c1, c2 = st.columns(2)
     with c1:
         start = st.date_input("Start date", value=date(2024, 1, 1), max_value=date.today())
@@ -237,6 +264,8 @@ with st.form("fishing_request", border=True):
 if submitted:
     if selected_label is None:
         st.error("Choose a geographical area before retrieving data.")
+    elif bounds is not None and (south >= north or west >= east):
+        st.error("Minimum latitude and longitude must be smaller than their respective maximum values.")
     elif start > end:
         st.error("The start date must be on or before the end date.")
     elif spatial == "CUSTOM" and (not math.isclose(grid_size * 10, round(grid_size * 10), abs_tol=1e-8) or 1800 % round(grid_size * 10) != 0):
@@ -249,6 +278,10 @@ if submitted:
         with st.spinner("Requesting fishing activity from Global Fishing Watch..."):
             try:
                 regional = asyncio.run(fetch_regional(TOKEN, start, end, "LOW" if spatial == "CUSTOM" else spatial, region_id, temporal))
+                source_rows = len(regional)
+                if bounds is not None and not regional.empty:
+                    regional = filter_coordinates(regional, bounds)
+                filtered_rows = len(regional)
                 if spatial == "CUSTOM" and not regional.empty:
                     regional = aggregate_grid(regional, grid_size)
                 if regional.empty:
@@ -264,6 +297,9 @@ if submitted:
                     details = {
                         "area": region_name,
                         "region_id": region_id,
+                        "bounds": bounds,
+                        "source_rows": source_rows,
+                        "filtered_rows": filtered_rows,
                         "start": start,
                         "end": end,
                         "spatial": spatial,
@@ -294,6 +330,7 @@ if saved is not None:
     if selected_label is None or region_labels.get(selected_label) != info["region_id"] or (
         start != info["start"] or end != info["end"] or spatial != info["spatial"]
         or temporal != info["temporal"] or include_global != info["include_global"]
+        or bounds != info.get("bounds")
         or (spatial == "CUSTOM" and grid_size != info.get("grid_size"))
     ):
         st.warning("Current form selections differ from the saved result below. Submit a new request to update it; these downloads still refer to the previous request.")
@@ -307,16 +344,23 @@ if saved is not None:
         f"**Period:** {info['start']} to {info['end']}  |  "
         f"**Spatial:** {info['spatial']}  |  **Temporal:** {info['temporal']}"
     )
+    if info.get("bounds"):
+        s, n, w, e = info["bounds"]
+        st.write(f"**Coordinate bounds:** latitude {s:g}° to {n:g}°, longitude {w:g}° to {e:g}°")
+        st.caption(f"Source rows within bounds: {info['filtered_rows']:,} of {info['source_rows']:,}. Selection uses source cell centres, not exact cell boundaries.")
     if info.get("grid_size"):
-        st.info(f"Custom {info['grid_size']:g}° grid: LOW (0.1°) source cells assigned by centre; hours summed by date and gear. Coordinates are custom cell centres, not vessel positions. Vessel counts are omitted because they cannot be safely summed.")
+        st.info(f"Custom {info['grid_size']:g}° grid: LOW (0.1°) source cells assigned by centre; hours summed by date and gear. Coordinates are custom cell centres, not vessel positions; after coordinate filtering, custom cell centres may fall outside the bounds. Vessel counts are omitted because they cannot be safely summed.")
     st.caption("Preview: first 10 rows only. The CSV contains all rows of the displayed dataset (locally aggregated when Custom is selected).")
     st.dataframe(regional.head(10), use_container_width=True, hide_index=True)
 
     spatial_code = f"custom_{info['grid_size']:g}deg" if info.get("grid_size") else info["spatial"][0]
+    bounds_code = ""
+    if info.get("bounds"):
+        bounds_code = "_box_" + "_".join(f"{v:.6f}".rstrip("0").rstrip(".") for v in info["bounds"])
     regional_name = (
         f"fishing_{filename_part(info['area'])}_{info['region_id']}_"
         f"{info['start']:%Y%m%d}-{info['end']:%Y%m%d}_"
-        f"{spatial_code}_{info['temporal'][0]}.csv"
+        f"{spatial_code}_{info['temporal'][0]}{bounds_code}.csv"
     )
     st.subheader("3 · Download for offline research")
     st.download_button(
@@ -344,7 +388,7 @@ if saved is not None:
             if "hours" in regional else float("nan")
         )
         x, y = st.columns(2)
-        x.metric("Regional sum of reported hours", f"{regional_hours:,.1f}" if pd.notna(regional_hours) else "Not available")
+        x.metric("Selected area sum of reported hours", f"{regional_hours:,.1f}" if pd.notna(regional_hours) else "Not available")
         y.metric("Worldwide reported activity hours", f"{global_hours:,.1f}" if pd.notna(global_hours) else "Not available")
         st.warning(
             "These two figures come from DIFFERENT GFW endpoints/aggregations. "
