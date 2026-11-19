@@ -7,6 +7,7 @@ import re
 from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
+import pycountry
 import requests
 import streamlit as st
 from gfwapiclient import Client
@@ -48,7 +49,7 @@ async def fetch_regional(token, start, end, spatial, region_id, temporal):
         datasets=[DATASET],
         spatial_resolution=spatial,
         temporal_resolution=temporal,
-        group_by="GEARTYPE",
+        group_by="FLAGANDGEARTYPE",
         start_date=start.isoformat(),
         end_date=(end + timedelta(days=1)).isoformat(),
         region={"dataset": REGION_DATASET, "id": str(region_id)},
@@ -72,13 +73,13 @@ def filter_coordinates(df, bounds):
 
 
 def aggregate_grid(df, grid_size):
-    """Sum fishing hours by date, gear and custom grid cell."""
+    """Sum fishing hours by date, flag, gear and custom grid cell."""
     # SDK exposes gear_type rather than geartype.
     if "gear_type" not in df and "geartype" in df:
         df = df.rename(columns={"geartype": "gear_type"})
-    required = {"lat", "lon", "hours", "date", "gear_type"}
+    required = {"lat", "lon", "hours", "date", "gear_type", "flag"}
     if not required.issubset(df.columns):
-        raise ValueError("Custom grid requires latitude, longitude, hours, date and gear type.")
+        raise ValueError("Custom grid requires latitude, longitude, hours, date, vessel flag and gear type.")
     data = df[list(sorted(required))].copy()
     if data["date"].isna().any():
         raise ValueError("Custom grid requires a valid reporting date.")
@@ -98,13 +99,13 @@ def aggregate_grid(df, grid_size):
     data["lat_cell"] = (lat + 9000) // step
     data["lon_cell"] = (lon + 18000) // step
     result = data.groupby(
-        ["date", "gear_type", "lat_cell", "lon_cell"], dropna=False, as_index=False
+        ["date", "flag", "gear_type", "lat_cell", "lon_cell"], dropna=False, as_index=False
     )["hours"].sum()
 
     # Calculate custom grid cell centres.
     result["lat"] = (-9000 + result["lat_cell"] * step + step / 2) / 100
     result["lon"] = (-18000 + result["lon_cell"] * step + step / 2) / 100
-    result = result[["date", "gear_type", "lat", "lon", "hours"]]
+    result = result[["date", "flag", "gear_type", "lat", "lon", "hours"]]
     if not math.isclose(float(result["hours"].sum()), float(data["hours"].sum()), rel_tol=1e-9, abs_tol=1e-9):
         raise ValueError("Custom grid did not preserve total fishing hours.")
     return result
@@ -133,6 +134,44 @@ def fetch_global(token, start, end):
     df["end_date"] = end.isoformat()
     df["scope"] = "worldwide_aggregate"
     return df
+
+
+def identify_flags(df):
+    """Preserve flags; label missing nationality."""
+    df = df.copy()
+    if "flag" not in df.columns:
+        df["flag"] = pd.NA
+    flags = df["flag"].astype("string").str.strip()
+    missing = flags.isna() | flags.str.lower().isin(["", "none", "null", "nan", "<na>"])
+    df["flag"] = flags.mask(missing, "Unknown")
+    return df
+
+
+def add_flag_names(df):
+    """Keep codes and add names."""
+    df = df.copy()
+    def country_name(code):
+        if pd.isna(code) or code == "Unknown":
+            return "Unknown"
+        key = str(code).strip().upper()
+        country = pycountry.countries.get(alpha_3=key)
+        if country is None and len(key) == 2:
+            country = pycountry.countries.get(alpha_2=key)
+        if country is None:
+            return f"Unmapped ({code})"
+        return getattr(country, "common_name", country.name)
+    names = {code: country_name(code) for code in df["flag"].dropna().unique()}
+    df.insert(df.columns.get_loc("flag"), "flag_country", df["flag"].map(names).fillna("Unknown"))
+    return df
+
+
+def coordinate_preview(df):
+    """Display coordinates without UI rounding."""
+    preview = df.head(10).copy()
+    for column in ("lat", "lon"):
+        if column in preview:
+            preview[column] = preview[column].map(lambda value: str(value) if pd.notna(value) else None)
+    return preview
 
 
 def remove_empty_columns(df):
@@ -182,9 +221,13 @@ def export_metadata(info, regional, global_df, quality):
         "spatial_resolution": info["spatial"],
         "custom_grid_degrees": info.get("grid_size"),
         "source_spatial_resolution": "LOW" if info.get("grid_size") else info["spatial"],
-        "custom_grid_method": "Source cell centres assigned to degree grid anchored at (-90, -180); hours summed by date and gear. Not area-weighted. Vessel counts are not summed." if info.get("grid_size") else None,
+        "custom_grid_method": "Source cell centres assigned to degree grid anchored at (-90, -180); hours summed by date, flag and gear. Not area-weighted. Vessel counts are not summed." if info.get("grid_size") else None,
         "temporal_resolution": info["temporal"],
-        "regional_grouping": "GEARTYPE",
+        "regional_grouping": "FLAGANDGEARTYPE",
+        "flag_definition": "Vessel flag code reported by GFW; Unknown denotes missing nationality, not the EEZ country.",
+        "flag_country_definition": "Readable ISO country name mapped from the vessel flag code using pycountry. Unmapped codes are retained and labelled; Unknown denotes missing nationality.",
+        "eez_country_definition": "Selected GFW EEZ reference label, which may identify a territory or disputed area rather than a sovereign state.",
+        "coordinate_precision": "Native grid coordinates preserved as received from the SDK; custom coordinates are computed cell centres. Preview uses text solely to avoid display rounding.",
         "regional_data_quality_checks": quality,
         "regional_columns_before_cleaning": info.get("columns_before_cleaning", len(regional.columns)),
         "regional_empty_columns_removed": info.get("empty_columns_removed", []),
@@ -269,6 +312,7 @@ with st.form("fishing_request", border=True):
             index=1,
             format_func=lambda t: {"DAILY": "Daily", "MONTHLY": "Monthly", "YEARLY": "Yearly"}[t],
         )
+    st.caption("Native grid sizes: LOW = 0.1°, HIGH = 0.01°. All coordinate digits supplied by the API are retained; extra GPS precision cannot be recovered. Custom grids use calculated cell centres.")
     grid_size = st.number_input(
         "Custom grid size (degrees)", min_value=0.1, max_value=10.0,
         value=0.5, step=0.1, format="%.1f",
@@ -301,6 +345,7 @@ if submitted:
                 if bounds is not None and not regional.empty:
                     regional = filter_coordinates(regional, bounds)
                 filtered_rows = len(regional)
+                regional = identify_flags(regional)
                 if spatial == "CUSTOM" and not regional.empty:
                     regional = aggregate_grid(regional, grid_size)
                 if regional.empty:
@@ -309,6 +354,9 @@ if submitted:
                     # Remove entirely empty columns.
                     columns_before_cleaning = len(regional.columns)
                     regional, empty_columns_removed = remove_empty_columns(regional)
+                    # Identify selected EEZ separately.
+                    regional.insert(0, "eez_country", region_name)
+                    regional = add_flag_names(regional)
                     worldwide = None
                     global_error = None
                     if include_global:
@@ -373,15 +421,18 @@ if saved is not None:
         st.write(f"**Coordinate bounds:** latitude {s:g}° to {n:g}°, longitude {w:g}° to {e:g}°")
         st.caption(f"Source rows within bounds: {info['filtered_rows']:,} of {info['source_rows']:,}. Selection uses source cell centres, not exact cell boundaries.")
     if info.get("grid_size"):
-        st.info(f"Custom {info['grid_size']:g}° grid: LOW (0.1°) source cells assigned by centre; hours summed by date and gear. Coordinates are custom cell centres, not vessel positions; after coordinate filtering, custom cell centres may fall outside the bounds. Vessel counts are omitted because they cannot be safely summed.")
+        st.info(f"Custom {info['grid_size']:g}° grid: LOW (0.1°) source cells assigned by centre; hours summed by date, flag and gear. Coordinates are custom cell centres, not vessel positions; after coordinate filtering, custom cell centres may fall outside the bounds. Vessel counts are omitted because they cannot be safely summed.")
     removed = info.get("empty_columns_removed", [])
     before = info.get("columns_before_cleaning", len(regional.columns))
-    st.caption(f"Dataset cleaning: {before} columns before cleaning; {len(removed)} entirely empty columns removed. No observations removed by cleaning.")
+    st.caption(f"Dataset cleaning: {before} columns before cleaning; {len(removed)} entirely empty columns removed. No observations removed by cleaning; EEZ identification and flag country names added after cleaning.")
     if removed:
         with st.expander("View removed empty columns"):
             st.write(", ".join(removed))
     st.caption("Preview: first 10 rows only. The CSV contains all rows of the displayed dataset (locally aggregated when Custom is selected).")
-    st.dataframe(regional.head(10), use_container_width=True, hide_index=True)
+    st.caption("EEZ country is the selected GFW area label. flag_country is the readable vessel flag country; flag retains the original code (Unknown if missing). Native coordinates retain all digits supplied by GFW; LOW uses 0.1° and HIGH uses 0.01°. Grid coordinates are not individual vessel GPS positions.")
+    if regional["flag"].eq("Unknown").all():
+        st.warning("No vessel flag nationality was returned for these observations. The EEZ label is not a substitute for vessel nationality.")
+    st.dataframe(coordinate_preview(regional), use_container_width=True, hide_index=True)
 
     spatial_code = f"custom_{info['grid_size']:g}deg" if info.get("grid_size") else info["spatial"][0]
     bounds_code = ""
@@ -454,7 +505,7 @@ if saved is not None:
 
 with st.expander("About the datasets and how to use them"):
     st.write(
-        "**Regional CSV:** detailed AIS-based apparent fishing-effort estimates grouped by gear type, "
+        "**Regional CSV:** detailed AIS-based apparent fishing-effort estimates grouped by vessel flag and gear type, "
         "with entirely empty columns removed from the selected report. "
         "**Worldwide CSV:** one aggregated statistics record for the requested date range. "
         "**Metadata JSON:** original settings, timestamp, quality checks and interpretation caveats. "
